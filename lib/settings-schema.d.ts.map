@@ -1,0 +1,1 @@
+{"version":3,"file":"settings-schema.d.ts","sourceRoot":"","sources":["../src/settings-schema.ts"],"names":[],"mappings":"AAAA;;;;;;;GAOG;AAEH,OAAO,CAAC,MAAM,0BAA0B,CAAA;AAcxC,OAAO,KAAK,EAAE,iBAAiB,EAAE,MAAM,eAAe,CAAA;AAEtD;;;;;GAKG;AACH,eAAO,MAAM,cAAc,EAAE;KAC1B,CAAC,IAAI,MAAM,iBAAiB,CAAC,CAAC,GAAG,CAAC,CAAC,iBAAiB,CAAC,CAAC,CAAC,CAAC;CAM1D,CAAA"}

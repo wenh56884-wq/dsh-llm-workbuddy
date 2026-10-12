@@ -1,0 +1,620 @@
+/**
+ * Host-side OAuth service exposed to the Web client over a private RPC channel.
+ *
+ * The browser login is long-running (it waits for a human to finish signing
+ * in), so it is split across RPC endpoints: `startLogin` mints the handshake
+ * and returns the URL the user must open, `pollLogin` checks whether that
+ * handshake has completed, and `cancelLogin` releases one the user abandoned
+ * before it commits a credential. `status` and `logout` are the read/clear
+ * pair the settings page drives the rest of the time.
+ *
+ * The channel is registered through `ctx.connection.rpc.handle` when the host
+ * allows it; on dsh 0.1.5-rc.1 that path throws (see the constructor), so an
+ * equivalent prefix route is registered on `ctx.webServer` directly, reusing
+ * the connection service's public trust fence. Both carry the same
+ * `client-request`/`server-response` JSON envelopes, so the client half needs
+ * no changes.
+ *
+ * @module dsh-llm-workbuddy-cn/auth-service
+ */
+
+import type { Context } from '@deepseek-ai/cordis'
+import { getLoginAccount, pollAuthToken, requestAuthState } from './workbuddy.js'
+import { buildStorage } from './login.js'
+import { resolveSite } from './constants.js'
+import type { WorkBuddySiteId } from './constants.js'
+import type { WorkBuddySession } from './session.js'
+import { clearStorage, loadStorage, saveStorage } from './storage.js'
+import type { WorkBuddyStorage } from './storage.js'
+import { hasDisclosedCapacity, isPromotionActive } from './types.js'
+import { prefersChinese } from './locale.js'
+import type { MessageLocale } from './locale.js'
+import type { WorkBuddyModel, WorkBuddyModelPromotion, WorkBuddyPromotionDiscount } from './types.js'
+import type { UsageSnapshot, UsageWindow } from './usage.js'
+import { WORKBUDDY_AUTH_CHANNEL } from './protocol.js'
+import type {
+  WorkBuddyAuthStatus,
+  WorkBuddyLoginPoll,
+  WorkBuddyLoginStart,
+  WorkBuddyModelEntry,
+  WorkBuddyModelsResult,
+  WorkBuddyPromotionView,
+  WorkBuddyUsageResult,
+  WorkBuddyUsageWindow,
+} from './protocol.js'
+
+export { WORKBUDDY_AUTH_CHANNEL } from './protocol.js'
+export type {
+  WorkBuddyAuthStatus,
+  WorkBuddyLoginPoll,
+  WorkBuddyLoginStart,
+  WorkBuddyModelEntry,
+  WorkBuddyModelsResult,
+  WorkBuddyPromotionView,
+  WorkBuddyUsageResult,
+  WorkBuddyUsageWindow,
+} from './protocol.js'
+
+/** One in-flight browser-login handshake, keyed by its own state. */
+interface PendingLogin {
+  state: string
+  controller: AbortController
+  /** Resolves to the persisted storage once `pollAuthToken` succeeds. */
+  promise: Promise<WorkBuddyStorage | undefined>
+}
+
+/** A successful RPC result. */
+interface RpcOk<T> { ok: true, value: T }
+/** A failed RPC result. */
+interface RpcErr { ok: false, error: { code: string, message: string, details: Record<string, unknown> } }
+
+function ok<T>(value: T): RpcOk<T> {
+  return { ok: true, value }
+}
+
+function err(code: string, message: string): RpcErr {
+  return { ok: false, error: { code, message, details: {} } }
+}
+
+/**
+ * Read the site out of a `startLogin` payload.
+ * @param payload - the RPC payload.
+ * @returns the requested site, or the default when absent or unknown.
+ */
+function siteOf(payload: unknown): WorkBuddySiteId {
+  const value = typeof payload === 'object' && payload !== null && 'site' in payload
+    ? (payload as { site: unknown }).site
+    : undefined
+  return resolveSite(value)
+}
+
+/**
+ * Project one owned-data {@link UsageWindow} into the RPC-safe shape the
+ * client receives, widening optional fields only when present.
+ * @param window - the metering window.
+ * @returns the client-safe projection.
+ */
+function projectWindow(window: UsageWindow): WorkBuddyUsageWindow {
+  return {
+    name: window.name,
+    ...window.used === undefined ? {} : { used: window.used },
+    ...window.limit === undefined ? {} : { limit: window.limit },
+    ...window.usedPercent === undefined ? {} : { usedPercent: window.usedPercent },
+    ...window.resetsAt === undefined ? {} : { resetsAt: window.resetsAt },
+  }
+}
+
+/**
+ * Project one catalog model into the RPC-safe shape the client receives.
+ * `undefined` optionals are widened only when present, so the client can test
+ * for absence with a single `!== undefined`.
+ *
+ * The description resolves to one string here, since the host knows the
+ * language and the client renders only one of WorkBuddy's wordings.
+ * @param model - one catalog entry.
+ * @param promotion - the winning promotion's display facts, when one runs.
+ * @param zh - whether the browser is displaying Chinese.
+ */
+function projectModel(
+  model: WorkBuddyModel,
+  promotion: WorkBuddyPromotionView | undefined,
+  zh: boolean,
+): WorkBuddyModelEntry {
+  const description = zh
+    ? model.descriptionZh ?? model.descriptionEn
+    : model.descriptionEn ?? model.descriptionZh
+  return {
+    id: model.id,
+    name: model.name,
+    ...model.credits === undefined ? {} : { credits: model.credits },
+    ...model.tags === undefined || model.tags.length === 0 ? {} : { tags: model.tags },
+    ...description === undefined ? {} : { description },
+    ...promotion === undefined ? {} : { promotion },
+  }
+}
+
+/**
+ * The active promotion for one model, when one runs.
+ *
+ * Among the promotions whose `modelIds` cover the model and whose schedule is
+ * currently active, the highest `priority` wins. Only the display facts (badge
+ * color/label, hover texts, discounted rate) cross the wire; scheduling stays
+ * host-side.
+ * @param promotions - the promotions from the config read.
+ * @param modelId - the model to resolve for.
+ * @returns the winning promotion's display facts, or undefined.
+ */
+function promotionFor(
+  promotions: readonly WorkBuddyModelPromotion[],
+  modelId: string,
+  zh: boolean,
+): WorkBuddyPromotionView | undefined {
+  let winner: { priority: number, view: WorkBuddyPromotionView } | undefined
+  for (const promotion of promotions) {
+    if (promotion.modelIds === undefined || !promotion.modelIds.includes(modelId)) continue
+    if (!isPromotionActive(promotion)) continue
+    const { color, label } = promotion.badge ?? {}
+    if (color === undefined || label === undefined) continue
+    const priority = promotion.priority ?? 0
+    if (winner !== undefined && winner.priority >= priority) continue
+    const { textZh, textEn } = promotion.hover ?? {}
+    const text = zh ? textZh ?? textEn : textEn ?? textZh
+    const discountedRate = discountedRateOf(promotion.discount)
+    winner = {
+      priority,
+      view: {
+        color,
+        label,
+        ...text === undefined ? {} : { text },
+        ...discountedRate === undefined ? {} : { discountedRate },
+      },
+    }
+  }
+  return winner?.view
+}
+
+/**
+ * Normalize a promotion's price override into a display label: the
+ * pre-formatted string wins when it parses, otherwise the numeric factor.
+ * @param discount - the promotion's price override, when it carries one.
+ * @returns the normalized `xN.nn` label, or undefined.
+ */
+function discountedRateOf(discount: WorkBuddyPromotionDiscount | undefined): string | undefined {
+  if (discount === undefined) return undefined
+  const fromLabel = parseRateLabel(discount.discountedCredits)
+  if (fromLabel !== undefined) return fromLabel
+  if (discount.factor !== undefined && Number.isFinite(discount.factor) && discount.factor >= 0) {
+    return `x${discount.factor.toFixed(2)}`
+  }
+  return undefined
+}
+
+/** Parse a rate label ("x0.79", "0.5x", "0") into `xN.nn`, or undefined. */
+function parseRateLabel(label: string | undefined): string | undefined {
+  if (label === undefined) return undefined
+  const match = /(\d+(?:\.\d+)?)/.exec(label)
+  const digits = match?.[1]
+  if (digits === undefined) return undefined
+  const value = Number.parseFloat(digits)
+  if (!Number.isFinite(value)) return undefined
+  return `x${value.toFixed(2)}`
+}
+
+/**
+ * The face this plugin needs off the host `connection` service.
+ *
+ * `rpc.handle` is the preferred registration; `requestRejection` backs the
+ * fallback route this plugin registers itself on hosts where `rpc.handle`
+ * cannot run (see the constructor).
+ */
+interface ConnectionService {
+  rpc: {
+    handle: (
+      channel: string,
+      handler: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<unknown>,
+      options?: { authority?: string },
+    ) => () => void
+  }
+  /** The Host/Origin + browser-authentication fence every RPC request passes. */
+  requestRejection: (request: { headers: Record<string, unknown> }) => number | undefined
+}
+
+/** The face this plugin needs off the host `webServer` service. */
+interface WebServerService {
+  register: (route: {
+    kind: 'prefix'
+    path: string
+    handler: (req: NodeIncomingMessage, res: NodeServerResponse) => void | Promise<void>
+  }) => () => void
+}
+
+/** Minimal node:http shapes the fallback route handler uses. */
+interface NodeIncomingMessage {
+  method?: string
+  url?: string
+  headers: Record<string, unknown>
+  socket: { destroyed?: boolean, errored?: boolean }
+  [Symbol.asyncIterator](): AsyncIterableIterator<string | Buffer>
+}
+
+interface NodeServerResponse {
+  writeHead(status: number, headers?: Record<string, unknown>): void
+  end(data?: string): void
+}
+
+/**
+ * The WorkBuddy auth RPC service.
+ *
+ * A handshake is started by `startLogin`, polled to completion by `pollLogin`
+ * (or released early by `cancelLogin`), and its credential is picked up by the
+ * adapter's `WorkBuddySession` on its next request — so a login completed
+ * through the UI reaches a running harness without a restart. `logout` cancels
+ * any in-flight handshake first, then clears the file and invalidates the
+ * session cache.
+ */
+export class WorkBuddyAuthService {
+  /** In-flight handshakes by state id. */
+  private readonly pending = new Map<string, PendingLogin>()
+
+  constructor(
+    ctx: Context,
+    private readonly session?: WorkBuddySession,
+    private readonly locale?: MessageLocale,
+  ) {
+    ctx.inject(['connection', 'webServer'], (scopeCtx) => {
+      const connection = scopeCtx.get('connection') as ConnectionService
+      try {
+        // Preferred: the connection service's own channel registry, which
+        // routes through its fetch bridge and owns the transport end to end.
+        scopeCtx.effect(() => connection.rpc.handle(
+          WORKBUDDY_AUTH_CHANNEL,
+          (endpoint, payload, signal) => this.dispatch(endpoint, payload, signal),
+          { authority: 'loopback' },
+        ), 'dsh-llm-workbuddy-cn: auth RPC channel')
+        return
+      } catch {
+        // dsh 0.1.5-rc.1 regression: `rpc.handle` reads `webServer` through
+        // the connection service's OWN fiber context, which does not declare
+        // it, and cordis's strict service access rejects the read — the throw
+        // escapes `handle()` before anything is registered. Fall back to
+        // registering an equivalent prefix route on `webServer` from THIS
+        // scope, reusing the service's public `requestRejection` fence so the
+        // Host/Origin check and browser-session authentication stay intact.
+      }
+      const webServer = scopeCtx.get('webServer') as WebServerService
+      scopeCtx.effect(() => webServer.register({
+        kind: 'prefix',
+        path: WORKBUDDY_AUTH_CHANNEL,
+        handler: (req, res) => this.handleFallbackRequest(connection, req, res),
+      }), 'dsh-llm-workbuddy-cn: auth RPC channel (fallback route)')
+    })
+  }
+
+  /**
+   * Serve one fallback-route RPC request.
+   *
+   * Mirrors the connection service's own HTTP adapter: the same trust fence,
+   * the same `client-request`/`server-response` JSON envelopes, the same
+   * 404/405/415-shaped answers for a non-RPC probe.
+   * @param connection - the host connection service (for the trust fence).
+   * @param req - the incoming node:http request.
+   * @param res - the response to write.
+   */
+  private async handleFallbackRequest(
+    connection: ConnectionService,
+    req: NodeIncomingMessage,
+    res: NodeServerResponse,
+  ): Promise<void> {
+    const rejection = connection.requestRejection(req)
+    if (rejection !== undefined) {
+      res.writeHead(rejection)
+      res.end(rejection === 401 ? 'unauthorized' : 'forbidden')
+      return
+    }
+    const pathname = new URL(req.url ?? '/', 'http://dsh.internal').pathname
+    const endpoint = pathname.startsWith(`${WORKBUDDY_AUTH_CHANNEL}/`)
+      ? pathname.slice(WORKBUDDY_AUTH_CHANNEL.length + 1)
+      : undefined
+    if (req.method !== 'POST' || endpoint === undefined || endpoint.includes('/')) {
+      res.writeHead(404)
+      res.end('not found')
+      return
+    }
+    const contentType = typeof req.headers['content-type'] === 'string'
+      ? req.headers['content-type'].split(';', 1)[0]?.trim().toLowerCase()
+      : undefined
+    if (contentType !== 'application/json') {
+      res.writeHead(415)
+      res.end('content type must be application/json')
+      return
+    }
+    let body: string
+    try {
+      const chunks: Buffer[] = []
+      for await (const chunk of req) chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk)
+      body = Buffer.concat(chunks).toString('utf8')
+    } catch {
+      res.writeHead(400)
+      res.end('failed to read request body')
+      return
+    }
+    let envelope: { rpcId?: unknown, method?: unknown, payload?: unknown }
+    try {
+      envelope = JSON.parse(body) as typeof envelope
+    } catch {
+      res.writeHead(400)
+      res.end('body is not JSON')
+      return
+    }
+    if (envelope.method !== endpoint) {
+      this.writeResponse(res, envelope.rpcId, {
+        ok: false,
+        error: {
+          code: 'gateway/bad-request',
+          message: `method ${JSON.stringify(String(envelope.method))} does not match endpoint ${JSON.stringify(endpoint)}`,
+          details: { issues: [] },
+        },
+      })
+      return
+    }
+    const rpcId = typeof envelope.rpcId === 'string' ? envelope.rpcId : 'invalid-request'
+    let result: RpcOk<unknown> | RpcErr
+    try {
+      result = await this.dispatch(endpoint, envelope.payload, new AbortController().signal)
+    } catch (error) {
+      res.writeHead(500)
+      res.end(`handler failure: ${String(error)}`)
+      return
+    }
+    this.writeResponse(res, rpcId, result)
+  }
+
+  /** Write one `server-response` envelope. */
+  private writeResponse(res: NodeServerResponse, rpcId: unknown, result: RpcOk<unknown> | RpcErr): void {
+    res.writeHead(200, { 'content-type': 'application/json' })
+    res.end(JSON.stringify({
+      type: 'server-response',
+      rpcId,
+      result,
+    }))
+  }
+
+  /** Route one RPC endpoint to its handler. */
+  private async dispatch(endpoint: string, payload: unknown, _signal: AbortSignal): Promise<RpcOk<unknown> | RpcErr> {
+    switch (endpoint) {
+      case 'status': return ok(await this.status())
+      case 'startLogin': return ok(await this.startLogin(siteOf(payload)))
+      case 'pollLogin': {
+        const state = typeof payload === 'object' && payload !== null && 'state' in payload
+          ? String((payload as { state: unknown }).state)
+          : ''
+        return ok(await this.pollLogin(state))
+      }
+      case 'cancelLogin': {
+        const state = typeof payload === 'object' && payload !== null && 'state' in payload
+          ? String((payload as { state: unknown }).state)
+          : ''
+        return ok(await this.cancelLogin(state))
+      }
+      case 'logout': return ok(await this.logout())
+      case 'usage': return ok(await this.usage())
+      case 'models': return ok(await this.models())
+      // The language is resolved in the browser and never reaches the host.
+      case 'locale': {
+        this.locale?.report(payload)
+        return ok(null)
+      }
+      default: return err('not-found', `unknown auth endpoint: ${endpoint}`)
+    }
+  }
+
+  /**
+   * Read the stored credential without requiring one.
+   *
+   * A stored file is not sufficient for `loggedIn: true`: a session whose
+   * access and refresh tokens have both expired reads as signed in but fails
+   * every request, which leaves the settings page claiming an account while the
+   * model list is empty and no error is shown. The credential is therefore
+   * probed for usability, and an unusable one reports `loggedIn: false` so the
+   * page offers the sign-in affordance. An unreachable service still reports
+   * signed in — the credential was not refused.
+   * @returns the current auth status; `loggedIn` is false when nothing usable is stored.
+   */
+  async status(): Promise<WorkBuddyAuthStatus> {
+    const stored = await loadStorage()
+    if (stored === undefined) {
+      return { loggedIn: false }
+    }
+    if (!(await this.session?.isUsable() ?? true)) {
+      // A credential is on disk but cannot authenticate: report the expiry so
+      // the page asks for a fresh sign-in instead of looking merely unused.
+      return { loggedIn: false, expired: true }
+    }
+    return {
+      loggedIn: true,
+      nickname: stored.account.nickname,
+      uid: stored.account.uid,
+      ...stored.account.uin === undefined ? {} : { uin: stored.account.uin },
+      ...stored.auth.domain.length === 0 ? {} : { domain: stored.auth.domain },
+      ...stored.account.enterpriseId === undefined ? {} : { enterpriseId: stored.account.enterpriseId },
+      ...stored.account.enterpriseName === undefined ? {} : { enterpriseName: stored.account.enterpriseName },
+      ...stored.account.enterpriseUserName === undefined ? {} : { enterpriseUserName: stored.account.enterpriseUserName },
+      ...stored.account.departmentFullName === undefined ? {} : { departmentFullName: stored.account.departmentFullName },
+    }
+  }
+
+  /**
+   * Start a browser-login handshake.
+   * @param site - the deployment to sign in to.
+   * @returns the URL the user must open.
+   */
+  async startLogin(site: WorkBuddySiteId): Promise<WorkBuddyLoginStart> {
+    const handshake = await requestAuthState(site)
+    const controller = new AbortController()
+    const pending: PendingLogin = {
+      state: handshake.state,
+      controller,
+      promise: this.runLogin(site, handshake.state, controller.signal),
+    }
+    this.pending.set(handshake.state, pending)
+    // Reap the entry once the handshake settles either way, so the table does
+    // not grow without bound for abandoned logins.
+    void pending.promise.finally(() => {
+      if (this.pending.get(handshake.state) === pending) {
+        this.pending.delete(handshake.state)
+      }
+    })
+    return { authUrl: handshake.authUrl, state: handshake.state }
+  }
+
+  /**
+   * Check whether a started handshake has completed.
+   * @param state - the handshake id from `startLogin`.
+   * @returns whether the login completed and the credential was persisted.
+   */
+  async pollLogin(state: string): Promise<WorkBuddyLoginPoll> {
+    const pending = this.pending.get(state)
+    if (pending === undefined) {
+      // Unknown/already-reaped state: surface as not-done rather than an error,
+      // because the client's poll loop may outlive the entry by one tick.
+      return { done: false }
+    }
+    const storage = await pending.promise
+    return {
+      done: storage !== undefined,
+      ...storage !== undefined ? { nickname: storage.account.nickname } : {},
+    }
+  }
+
+  /**
+   * Cancel a started browser-login handshake.
+   *
+   * The entry is dropped first so no later `pollLogin` attaches to it, and the
+   * run is awaited rather than merely signalled: `abort()` only requests
+   * cancellation, so returning early would report a cancel while the run may
+   * still be writing a credential.
+   * @param state - the handshake id from `startLogin`.
+   */
+  async cancelLogin(state: string): Promise<void> {
+    const pending = this.pending.get(state)
+    if (pending === undefined) return
+    this.pending.delete(state)
+    pending.controller.abort()
+    await pending.promise
+  }
+
+  /**
+   * Cancel every in-flight handshake and await them all.
+   *
+   * `logout` needs this: a run still in flight would otherwise persist its
+   * credential *after* the store was cleared.
+   */
+  private async cancelAllLogins(): Promise<void> {
+    const pending = [...this.pending.values()]
+    this.pending.clear()
+    for (const entry of pending) entry.controller.abort()
+    await Promise.all(pending.map(entry => entry.promise))
+  }
+
+  /** Remove the stored credential. */
+  async logout(): Promise<void> {
+    await this.cancelAllLogins()
+    await clearStorage()
+    // Drop the in-memory cache so the next request re-reads disk (finds
+    // nothing) instead of serving the now-revoked token.
+    this.session?.invalidate()
+    // The picker's model list belonged to the account that just left; announce
+    // so the client drops it instead of showing a signed-out user its models.
+    this.session?.announceCatalogChange()
+  }
+
+  /**
+   * Read the WorkBuddy usage snapshot for the settings surface.
+   *
+   * Delegates to the session, which resolves a refreshed identity before the
+   * meter read and never throws on a meter outage. A signed-out account is
+   * reported as `loggedIn: false` with empty windows so the client can hide
+   * the affordance rather than render a broken bar.
+   * @returns the usage projection, or a signed-out shape when nothing is stored.
+   */
+  async usage(): Promise<WorkBuddyUsageResult> {
+    const snapshot: UsageSnapshot | undefined = await this.session?.usage()
+    if (snapshot === undefined) {
+      return { loggedIn: false, windows: [] }
+    }
+    const windows = snapshot.windows.map(projectWindow)
+    const primary = snapshot.primary !== undefined ? projectWindow(snapshot.primary) : undefined
+    return { loggedIn: true, windows, ...primary === undefined ? {} : { primary } }
+  }
+
+  /**
+   * Read the WorkBuddy model catalog with its display facts (credits, tags,
+   * locale descriptions) for the model selector.
+   *
+   * Bypasses the session's catalog TTL: this endpoint is called when the user
+   * opens the model menu, which is exactly the moment a server-side add or
+   * delete must become visible rather than up to five minutes later. The read
+   * is single-flighted and floor-limited inside the session, so a burst of
+   * opens costs at most one config request. When the read changes the catalog,
+   * the session notifies the plugin, which republishes `llm/adapters-updated`
+   * so the harness catalog the client renders its groups from is dropped and
+   * refetched too — otherwise the enriched rows here would update while the
+   * group list stayed stale.
+   *
+   * Only models with disclosed capacities are shipped — the same offerability
+   * rule `listModels` applies, so the client's enriched rows align with the
+   * rows the harness catalog already renders.
+   * @returns the enriched catalog, or a signed-out shape when nothing usable is stored.
+   */
+  async models(): Promise<WorkBuddyModelsResult> {
+    if (this.session === undefined) return { loggedIn: false, models: [] }
+    // Report the real login state rather than an unconditional `true`: the
+    // client uses this flag to decide whether to render the rows at all, and a
+    // signed-out session must not look like a signed-in one with no models.
+    if (!(await this.session.isUsable())) return { loggedIn: false, models: [] }
+    const { models, promotions } = await this.session.refreshCatalog()
+    // Read once per catalog read, so one menu cannot split between wordings.
+    const zh = prefersChinese(this.locale?.tag())
+    return {
+      loggedIn: true,
+      models: models.filter(hasDisclosedCapacity).map(model =>
+        projectModel(model, promotionFor(promotions, model.id, zh), zh)),
+    }
+  }
+
+  /**
+   * Drive one handshake to a persisted credential.
+   *
+   * Reuses `buildStorage` so the on-disk shape is identical to the CLI login.
+   * Returns `undefined` on any failure so the client's poll resolves
+   * `done: false` and may retry from `startLogin`.
+   *
+   * The signal cancels the in-flight reads, narrowing the window in which a
+   * cancel can still commit: an abort that lands after the check below cannot
+   * stop the write, so the closing guarantee is not this check but the callers
+   * — `cancelLogin` and `logout` await this run before reporting, and the
+   * client re-reads `status` rather than assuming the cancel won.
+   */
+  private async runLogin(site: WorkBuddySiteId, state: string, signal: AbortSignal): Promise<WorkBuddyStorage | undefined> {
+    try {
+      const token = await pollAuthToken(site, state, signal)
+      if (token === undefined) return undefined
+      const account = await getLoginAccount(site, state, token.accessToken, token.domain, signal)
+      // Last chance to drop a cancelled attempt before anything is persisted.
+      if (signal.aborted) return undefined
+      const storage = buildStorage(site, token, account)
+      await saveStorage(storage)
+      // Drop the in-memory cache so the next request picks up the freshly
+      // written credential rather than the pre-login one.
+      this.session?.invalidate()
+      // The new account has its own model list; announce so the client drops
+      // whatever it cached for the previous (possibly signed-out) state.
+      this.session?.announceCatalogChange()
+      return storage
+    } catch {
+      // A transport or service failure ends the handshake; the client may
+      // retry from `startLogin`.
+      return undefined
+    }
+  }
+}
